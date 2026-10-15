@@ -1,0 +1,402 @@
+---
+title: "Jags Models seperated Din"
+output: html_notebook
+---
+
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(mgcv) # gam
+library(ggplot2)
+library(readr)
+library(splines) #bsplines
+library(rjags)
+library(purrr)
+```
+
+
+
+NOTE: the data code is inwithout_zoo_longer_period.Rmd + data_handling.Rmd
+
+
+```{r}
+#Step 1
+#complete cases
+
+complete_vars <- complete.cases(
+  eymir_seasonal_df_long[, c("log_din", "din_lag7", "mean_depth","mean_temp", "Month", "fish_removal", "log_srp",
+                            "srp_lag7", "large_biomass","small_biomass","mean_secchi", "log_din_lag1", "log_din_lag7","log_srp_lag7","log_chla_lag7")] 
+  ) # other variable will be added as the model proceeds
+
+df_long_period_clean <- eymir_seasonal_df_long[complete_vars,]
+
+### Check this step
+cat("Rows after complete case filter:", nrow(df_long_period_clean), "\n")
+
+
+```
+  
+
+```{r}
+#Step 2
+# Fitting the GAM for din
+##### gam model bayes starter
+
+din_gam_ps_f <- gam(log_din ~ mean_depth + mean_temp   + s(IntLoadDIN, bs="ps", k= 10),   data = eymir_seasonal_df_long, method= "REML") 
+#  what about by=month but lag1, and #lag7 yapınca depth significant but, r^2 low
+
+din_gam_f <- gam(log_din ~ mean_depth + mean_temp   + IntLoadDIN,   data = eymir_seasonal_df_long, method= "REML") 
+#  what about by=month but lag1, and #lag7 yapınca depth significant but, r^2 low
+
+summary(din_gam_ps_f)
+summary(din_gam_f)
+```
+
+
+```{r}
+#Step3
+#### Extracting knots from the GAM 
+## as the model proceeds other parameter chuncks can be added 
+
+smooth_din <- din_gam_ps_f$smooth[[1]] # first smooth term (din_lag7)
+
+knots_used_din <- smooth_din$knots # knots sequence mgcv used
+
+order_din <- smooth_din$m[1]+2  #spline order (4= cubic)
+
+cat("din_lag7: knots=", length(knots_used_din),
+    "| spline order =", order_din, "\n")
+
+
+
+```
+
+
+```{r}
+#Step4
+## call x from df_long_period_clean, so that rows align with y, depth, temp, etc
+
+
+b_din <- splineDesign(
+  knots = knots_used_din,
+  x= df_long_period_clean$IntLoadDIN, # from the cleaned data frame
+  ord = order_din, 
+  outer.ok = TRUE
+)
+## NOTE: write more explanations
+
+b_din_centered <- scale(b_din, center = TRUE, scale = FALSE)
+
+
+K_din <- ncol(b_din) # number of basis functions for din smooth
+
+cat("b_din dimensions:", nrow(b_din), "x", K_din, "\n")
+
+```
+
+
+```{r}
+#Step 5
+
+N <- nrow(df_long_period_clean) #number of shared row number
+
+#n_months <- length(unique(df_long_period_clean$Month))
+
+#covariates
+
+depth_s <- as.numeric(scale(df_long_period_clean$mean_depth))
+temp_s <- as.numeric(scale(df_long_period_clean$mean_temp))
+
+
+# sanity check - eveything must have length N ##### this part is recommended by AI
+
+stopifnot(nrow(b_din) == N)
+stopifnot(length(df_long_period_clean$log_din_lag7) == N)
+stopifnot(length(depth_s) == N)
+stopifnot(length(temp_s)  == N)
+cat("All dimensions check passed. N =", N, "\n")
+
+```
+
+
+```{r}
+# Step 6 
+
+
+jags_data_din <- list(
+  N              = N,
+  K_din          = K_din,
+  y_din          = df_long_period_clean$log_din,
+  b_din_centered = b_din_centered,
+  depth          = depth_s,
+  temp           = temp_s      # ← no comma here
+)
+
+# Final check — print length/nrow of every element # AI recommended
+cat("jags_data dimensions:\n")
+sapply(jags_data_din, function(x) if (is.matrix(x)) nrow(x) else length(x))
+
+ din_basis_center <- attr(b_din_centered, "scaled:center")
+
+```
+
+```{r}
+#Step 7
+
+model_string_din <- "
+model{
+
+#Likelihood
+
+for( i in 1:N){
+y_din[i] ~ dnorm(mu_din[i], tau_y_din) # likelihood function
+
+mu_din[i] <- alpha_din + #intercept
+             beta_depth * depth[i] + # covariates 
+             beta_temp * temp[i] +
+             inprod(b_din_centered[i,], coef_din[1:K_din])
+             
+           
+             
+}
+
+#P-spline prior : log_din_lag7 
+# second_order random-walk -penalises curvature
+# add the folloeing  block for smooths
+
+coef_din[1] ~dnorm(0, 0.0001) 
+# flat prior : different treatment due to not having j-1 and j-2
+coef_din[2]~dnorm(0, 0.0001) 
+# flat priors because we cannot penalise them
+ 
+ for (j in 3:K_din){
+ coef_din[j] ~ dnorm(2*coef_din[j-1]- coef_din[j-2], tau_b_din)
+ #curvature penalty means that each new coef should not deviate much from the linear trend of the previous two
+ }
+
+## parametric priors
+
+alpha_din ~dnorm(0, 0.0001) # intercept for din
+beta_depth ~dnorm(0, 0.0001) # effect of mean_depth
+beta_temp ~ dnorm(0, 0.0001) # effect of mean_temp
+
+#for (m in 1 :n_months){
+#beta_month[m] ~ dnorm(0, 0.0001) # month_specific intercept shifts
+
+ 
+#hyperpriors 
+
+tau_y_din    ~ dgamma(2, 0.5)          # weakly informative residual precision
+sigma_b_din  ~ dexp(7.3)                 # smoothing SD — same fix as SRP depth
+tau_b_din    <- 1 / (sigma_b_din * sigma_b_din)
+
+
+#derived quantities
+
+sigma_y_din <- 1/ sqrt(tau_y_din) # residual for SD for din
+
+ }
+
+"
+```
+
+
+```{r}
+#Step 8
+
+inits_din <- function() list(
+  alpha_din = 0,
+  beta_depth = 0,
+  beta_temp = 0,
+  coef_din = rep(0, K_din),
+  tau_y_din = 1,
+  sigma_b_din = 1
+  #coef_srp = rep(0,K_srp),
+)
+
+library(rjags) ######
+
+
+jags_model_din <- jags.model(
+  textConnection(model_string_din),
+  data = jags_data_din,
+  inits= inits_din,
+  n.chains = 3,
+  n.adapt = 1000
+)
+
+#Burn-in
+update(jags_model_din, n.iter= 2000)
+
+#sample
+
+params_to_monitor <- c(
+  "alpha_din", "beta_depth", "beta_temp","coef_din", "sigma_y_din","sigma_b_din"
+  # add "coef_srp", "sigma_y_srp"
+)
+
+samples_din <- coda.samples(
+  jags_model_din,
+  variable.names = params_to_monitor,
+  n.iter = 10000,
+  thin = 2
+)
+
+summary(samples_din)
+
+
+##### corrections needed in this code especialaly at depth, temp etc part
+
+```
+
+
+```{r}
+# Step 8 — 3 different initial values to test convergence
+
+inits_list_din <- list(
+  list(
+    alpha_din = 0,
+    beta_depth = 0,
+    beta_temp  = 0,
+    coef_din   = rep(0, K_din),
+    tau_y_din  = 1,
+    sigma_b_din  = 0.5
+  ),
+  list(
+    alpha_din = 2,
+    beta_depth = 1,
+    beta_temp  = 1,
+    coef_din   = rep(1, K_din),
+    tau_y_din  = 0.1,
+    sigma_b_din  = 2
+  ),
+  list(
+    alpha_din = 5,
+    beta_depth = 3,
+    beta_temp  = 10,
+    coef_din   = rep(-1, K_din),
+    tau_y_din  = 10,
+    sigma_b_din  = 1
+  )
+)
+
+# ── Run with NO burn-in first so you can see the full trace ───────────────────
+#jags_model_diag_din <- jags.model(
+ # textConnection(model_string_din),
+  #data     = jags_data,
+  #inits    = inits_list_din,
+  #n.chains = 3,
+  #n.adapt  = 100,# adaptation phase — not burn-in
+
+
+```
+
+
+```{r}
+# Sample with 0 burn-in — just collect raw chains
+#samples_diag_din <- coda.samples(
+#  jags_model_diag_din,
+#  variable.names = c("alpha_din", "beta_depth", "beta_temp",
+                 #    "beta_fish", "sigma_y_din", "sigma_b_din"),
+ # n.iter = 5000,
+  #thin   = 1
+#)
+
+#summary(samples_diag_din)
+```
+
+note on thinning: 
+Therefore, it is standard to make inference on "thinned" chains where only a fraction of the MCMC iterations are used in inference (e.g. only every fifth, tenth, or hundredth iteration, depending on the severity of the autocorrelation).
+
+on adaptation phase:
+When a JAGS model is compiled, it may require an initial sampling phase during which the samplers adapt their behaviour to maximize their efficiency (e.g. a Metropolis-Hastings random walk algorithm may change its step size). The sequence of samples generated during this adaptive phase is not a Markov chain, and therefore may not be used for posterior inference on the model.
+```{r}
+# ── Clean reset may be needed
+
+# ── Fresh chain function ──────────────────────────────────────────────────────
+fresh_chains_din <- function(n_iter) {
+  
+  jags_model_diag_din <- jags.model(
+    textConnection(model_string_din),
+    data     = jags_data_din,
+    inits    = inits_list_din,
+    n.chains = 3,
+    n.adapt  = 1          # no adaptation
+  )
+  
+  samples_din <- coda.samples(
+    jags_model_diag_din,
+    variable.names = c("alpha_din", "beta_depth", "beta_temp",
+                        "sigma_y_din", "sigma_b_din"),
+    n.iter = n_iter,      # uses the argument, not hardcoded 5000
+    thin   = 1
+  )
+  
+  return(samples_din)
+}
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+samples_diag_din <- fresh_chains_din(n_iter = 12000)
+
+# ── Verify ────────────────────────────────────────────────────────────────────
+cat("Iterations per chain:", nrow(samples_diag_din[[1]]), "\n")  # must be 5000
+
+# ── Convert to long df ────────────────────────────────────────────────────────
+params_diag_din <- c("alpha_din", "beta_depth", "beta_temp",
+                      "sigma_y_din", "sigma_b_din")
+
+chains_df_din <- do.call(rbind, lapply(1:3, function(c) {
+  df <- as.data.frame(samples_diag_din[[c]])
+  df$iteration <- 1:nrow(df)
+  df$chain     <- paste0("Chain ", c)
+  df
+})) %>%
+  pivot_longer(cols      = all_of(params_diag_din),
+               names_to  = "parameter",
+               values_to = "value")
+
+# ── One plot per parameter ────────────────────────────────────────────────────
+params_diag_din %>% walk(function(param) {
+  
+  p <- chains_df_din %>%
+    filter(parameter == param) %>%
+    ggplot(aes(x = iteration, y = value, colour = chain)) +
+    geom_line(alpha = 0.8, linewidth = 0.4) +
+    scale_colour_manual(values = c("Chain 1" = "#E05C2A",
+                                   "Chain 2" = "#2A6EA0",
+                                   "Chain 3" = "#4DAF4A")) +
+    labs(
+      title    = paste0("Trace: ", param),
+      subtitle = "3 chains from different starting values | no adaptation | no burn-in",
+      x        = "Iteration",
+      y        = "Value",
+      colour   = NULL
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      legend.position  = "top",
+      panel.grid.minor = element_blank()
+    )
+  
+  print(p)
+})
+
+```
+
+
+
+```{r}
+# Or with ggplot via tidybayes for cleaner output
+library(bayesplot)
+mcmc_trace(samples_diag_din,
+           pars = c("alpha_din", "beta_depth", "beta_temp",
+                    "sigma_y_din", "sigma_b_din"))
+
+# ── Gelman-Rubin diagnostic — values close to 1.00 = converged ───────────────
+gelman.diag(samples_diag_din)
+gelman.plot(samples_diag_din)   # shows convergence over iterations
+```
+
+
